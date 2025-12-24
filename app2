@@ -1,0 +1,1224 @@
+import eventlet
+
+eventlet.monkey_patch()
+import markdown
+
+from flask import Flask, render_template, request, jsonify
+from flask_socketio import SocketIO
+from nlp_engine import nlp_engine
+import pandas as pd
+from datetime import datetime, timedelta
+import os
+from request_to_openai import gpt
+import matplotlib
+import requests
+
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import threading
+import time
+import re
+import boto3
+import json
+from io import StringIO
+from dotenv import load_dotenv
+import logging
+from libre_link_integration import LibreLinkUpAPI
+
+# Load environment variables
+load_dotenv()
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Flask & SocketIO setup
+app = Flask(__name__)
+socketio = SocketIO(app, async_mode='eventlet', cors_allowed_origins="*")
+
+# AWS S3 Configuration
+S3_KEY_ID = os.getenv("S3_KEY_ID", "")
+S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "remonitest")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+PATIENT_ID = os.getenv("PATIENT_ID", "00001")
+S3_POLL_INTERVAL = 5
+
+# LibreLink Configuration
+LIBRELINK_EMAIL = os.getenv("LIBRELINK_EMAIL", "")
+LIBRELINK_PASSWORD = os.getenv("LIBRELINK_PASSWORD", "")
+
+# Initialize S3 client
+try:
+    s3_client = boto3.client(
+        service_name='s3',
+        region_name=AWS_REGION,
+        aws_access_key_id=S3_KEY_ID,
+        aws_secret_access_key=S3_SECRET_KEY
+    )
+    logger.info("✅ AWS S3 client initialized successfully")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize S3 client: {e}")
+    s3_client = None
+
+# Initialize LibreLink
+libre_api = LibreLinkUpAPI(s3_client, S3_BUCKET_NAME, PATIENT_ID) if s3_client else None
+
+
+class EdgeDeviceClient:
+    """Client to communicate with Raspberry Pi edge device for real-time data"""
+
+    def __init__(self, edge_device_ip=None, port=5000):
+        self.edge_device_ip = edge_device_ip
+        self.port = port
+        self.base_url = f"http://{edge_device_ip}:{port}" if edge_device_ip else None
+        self.timeout = 5
+
+    def set_edge_device_ip(self, ip_address):
+        """Update edge device IP address"""
+        self.edge_device_ip = ip_address
+        self.base_url = f"http://{ip_address}:{self.port}"
+        logger.info(f"📶 Edge device IP set to: {ip_address}")
+
+    def is_available(self):
+        """Check if edge device is reachable"""
+        if not self.base_url:
+            return False
+
+        try:
+            response = requests.get(f"{self.base_url}/health", timeout=self.timeout)
+            return response.status_code == 200
+        except:
+            return False
+
+    def get_realtime_vitals(self):
+        """Fetch real-time vitals directly from edge device"""
+        if not self.base_url:
+            return None
+
+        try:
+            logger.info(f"🔄 Fetching real-time vitals from edge device")
+            response = requests.get(f"{self.base_url}/api/realtime_vitals?fresh=true", timeout=self.timeout)
+
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    logger.info(f"✅ Got real-time vitals from edge device")
+                    return data.get('vitals')
+        except:
+            pass
+        return None
+
+
+# Initialize Edge Device Client
+edge_device_client = EdgeDeviceClient()
+logger.info("✅ Edge device client initialized (IP will be set automatically)")
+
+# Storage for data
+latest_vitals = {
+    'heart_rate': 0,
+    'spo2': 0,
+    'blood_pressure': {'systolic': 0, 'diastolic': 0},
+    'skin_temperature': 0,
+    'timestamp': 0,
+    'datetime': 'Never',
+    'patient_id': PATIENT_ID
+}
+
+latest_glucose = {
+    'value_mgdl': 0,
+    'trend_arrow': 0,
+    'is_high': False,
+    'is_low': False,
+    'datetime': 'Never',
+    'patient_id': PATIENT_ID
+}
+
+fall_alerts = []
+vitals_df = pd.DataFrame()
+glucose_df = pd.DataFrame()
+last_signal_timestamp = 0
+last_wifi_timestamp = 0
+latest_wifi_connection = None
+emitted_alert_ids = set()
+
+setup_state = {
+    'setup_completed': False,
+    'current_step': None,
+    'libre_credentials': {},
+    'edge_device_connected': False,
+    'watch_connected': False,
+    'libre_setup_completed': False
+}
+
+PLOT_FOLDER = './static/local_data/show_data/'
+os.makedirs(PLOT_FOLDER, exist_ok=True)
+
+
+def get_ai_response(question, vitals_data, glucose_data):
+    """Get intelligent AI response using OpenAI GPT"""
+    try:
+        context = f"""You are REMONI, a friendly and professional virtual nurse assistant.
+
+Current Patient Data (Patient ID: {PATIENT_ID}):
+- Heart Rate: {vitals_data.get('heart_rate', 'N/A')} BPM
+- SpO2: {vitals_data.get('spo2', 'N/A')}%
+- Blood Pressure: {vitals_data['blood_pressure']['systolic']}/{vitals_data['blood_pressure']['diastolic']} mmHg
+- Skin Temperature: {vitals_data.get('skin_temperature', 'N/A')}°C
+- Blood Glucose: {glucose_data.get('value_mgdl', 'N/A')} mg/dL
+- Last Update: {vitals_data.get('datetime', 'Never')}
+
+Your Role:
+- You monitor patient vitals, glucose levels, and fall detection 24/7
+- You provide helpful, accurate, and concise responses
+- You're friendly but professional
+- You can answer questions about the patient's health data
+
+Guidelines:
+- Keep responses concise (2-3 sentences for simple questions)
+- Be warm and empathetic
+- If asked about specific data, reference the actual values above
+- If greeting, respond naturally and ask how you can help
+- Don't make medical diagnoses, but note concerning values
+
+Respond naturally to the user's question."""
+
+        response = gpt(
+            text=question,
+            system_prompt=context,
+            model_name="gpt-3.5-turbo",
+            temperature=0.7,
+            max_tokens=300
+        )
+        return response
+
+    except Exception as e:
+        logger.error(f"AI response error: {e}")
+        return "I'm having trouble processing that. You can ask about vitals, glucose, or system status."
+
+
+SETUP_INSTRUCTIONS = {
+    'welcome': """👋 Hello! I'm REMONI, your virtual nurse.
+I'll help you set up your health monitoring system.
+Type 'start' to begin or 'skip' if already set up.""",
+
+    'step1_power': """🔌 Step 1: Plug in Your Device
+1. Take the small device from the box
+2. Plug the USB cable into it
+3. Plug the other end into a wall outlet
+4. You should see small lights turn on
+💡 Keep it plugged in all the time.
+✅ Type 'next' when you see the lights""",
+
+    'step2_wifi_setup': """📱 Step 2: Connect to Setup WiFi
+1. On your phone, go to WiFi Settings
+2. Look for "REMONI-Setup"
+3. Tap it and enter password: remoni2024
+4. Wait until it says "Connected"
+⚠️ Your phone internet will stop for a minute - that's normal!
+✅ Type 'next' when connected""",
+
+    'step3_wifi_config': """🌐 Step 3: Choose Your Home WiFi
+1. Open your web browser
+2. Type: 10.42.0.1
+3. Tap "SCAN FOR NETWORKS"
+4. Choose your home WiFi
+5. Enter your WiFi password
+6. Tap "Connect"
+7. Wait about 30 seconds
+✅ Type 'next' when you see "Connection Successful" """,
+
+    'step4_glucose_intro': """📊 Step 4: Glucose Monitoring (Optional)
+Do you want to track blood sugar automatically?
+You need:
+• A glucose sensor (like FreeStyle Libre)
+• The FreeStyle Libre app
+Type 'next' to set it up
+Type 'skip' if you don't want it""",
+
+    'step5_libre_app': """📱 Step 5: Download Glucose Apps
+You need TWO apps:
+App 1: FreeStyle Libre
+• Go to App Store or Play Store
+• Search "FreeStyle Libre"
+• Download and open it
+• Scan your sensor
+App 2: LibreLinkUp
+• Search "LibreLinkUp"
+• Download it
+• Create a NEW account
+• Remember your email and password!
+✅ Type 'next' when both are installed""",
+
+    'step6_connect_apps': """🔗 Step 6: Connect the Apps
+1. Open FreeStyle Libre app
+2. Tap menu (three lines)
+3. Find "Connected Apps"
+4. Tap "LibreLinkUp"
+5. Tap "Add Connection"
+6. Enter your LibreLinkUp email
+7. Tap "Send"
+✅ Type 'next' when done""",
+
+    'step7_accept_connection': """✉️ Step 7: Accept Connection
+1. Open LibreLinkUp app
+2. You'll see a notification
+3. Tap "Accept"
+4. Check you can see your glucose
+✅ Type 'next' when you see it""",
+
+    'step8_enter_credentials': """🔐 Step 8: Enter Your Login
+Type your LibreLinkUp login like this:
+email: your_email@example.com
+password: your_password
+Example:
+email: john@gmail.com
+password: MyPass123
+⚠️ Your info is safe and secure.""",
+
+    'step9_watch_app': """⌚ Step 9: Connect Your Watch
+1. Open REMONI app on your watch
+2. You'll see "Enter IP Address"
+3. Type this address: {edge_ip}
+4. Tap "Connect"
+5. Wait for "Connected" message
+✅ Type 'next' when connected""",
+
+    'step10_complete': """🎉 All Done! REMONI is Working!
+✅ Your Home Device - Connected
+✅ Glucose Monitoring - {glucose_status}
+✅ Smartwatch - {watch_status}
+I'm now monitoring your health 24/7.
+Ask me anything!
+• "What's my glucose?"
+• "Show heart rate"
+• "Any falls today?"
+How can I help?"""
+}
+
+
+def filter_df_by_time_range(df, minutes=10):
+    """Filter dataframe by time range"""
+    if df.empty:
+        return df
+
+    timestamp_col = 'time_stamp' if 'time_stamp' in df.columns else 'datetime'
+
+    try:
+        df[timestamp_col] = pd.to_datetime(df[timestamp_col], format='mixed')
+    except:
+        try:
+            df[timestamp_col] = pd.to_datetime(df[timestamp_col])
+        except:
+            logger.error(f"Failed to parse datetime in column {timestamp_col}")
+            return df
+
+    cutoff_time = datetime.now() - timedelta(minutes=minutes)
+    return df[df[timestamp_col] >= cutoff_time].copy()
+
+
+def filter_df_by_record_count(df, num_records=10):
+    """Filter dataframe by number of most recent records"""
+    if df.empty:
+        return df
+
+    timestamp_col = 'time_stamp' if 'time_stamp' in df.columns else 'datetime'
+
+    try:
+        df[timestamp_col] = pd.to_datetime(df[timestamp_col], format='mixed')
+    except:
+        try:
+            df[timestamp_col] = pd.to_datetime(df[timestamp_col])
+        except:
+            logger.error(f"Failed to parse datetime in column {timestamp_col}")
+            return df
+
+    df = df.sort_values(timestamp_col)
+    return df.tail(num_records).copy()
+
+
+def create_plot(df, vital_sign, time_range_minutes=None, title_suffix=None):
+    """Create plot for vital sign"""
+    if df.empty:
+        return None
+
+    timestamp_col = 'time_stamp' if 'time_stamp' in df.columns else 'datetime'
+
+    try:
+        df[timestamp_col] = pd.to_datetime(df[timestamp_col], format='mixed')
+    except:
+        try:
+            df[timestamp_col] = pd.to_datetime(df[timestamp_col])
+        except Exception as e:
+            logger.error(f"Failed to parse datetime: {e}")
+            return None
+
+    df = df.sort_values(timestamp_col)
+    df_clean = df[df[vital_sign].notna()].copy()
+
+    if df_clean.empty:
+        return None
+
+    plt.figure(figsize=(14, 8))
+    plt.plot(df_clean[timestamp_col], df_clean[vital_sign],
+             marker='o', linestyle='-', linewidth=2.5, markersize=7, color='#2196F3')
+
+    title = f"{vital_sign.replace('_', ' ').title()}"
+    if title_suffix:
+        title += f" - {title_suffix}"
+    elif time_range_minutes:
+        title += f" - Last {time_range_minutes} Minutes"
+
+    plt.title(title, fontsize=18, fontweight='bold')
+    plt.xlabel('Time', fontsize=14)
+
+    ylabel = vital_sign.replace('_', ' ').title()
+    if vital_sign == 'heart_rate':
+        ylabel += ' (BPM)'
+    elif vital_sign == 'spo2':
+        ylabel += ' (%)'
+    elif vital_sign == 'skin_temperature':
+        ylabel += ' (°C)'
+    elif 'blood_pressure' in vital_sign:
+        ylabel += ' (mmHg)'
+    elif vital_sign == 'value_mgdl':
+        ylabel = 'Blood Glucose (mg/dL)'
+
+    plt.ylabel(ylabel, fontsize=14)
+    plt.xticks(rotation=45, ha='right', fontsize=12)
+    plt.yticks(fontsize=12)
+    plt.grid(True, alpha=0.3, linewidth=1.2)
+    plt.tight_layout()
+
+    plot_filename = f'plot_{vital_sign}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png'
+    plot_path = os.path.join(PLOT_FOLDER, plot_filename)
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    return f'/static/local_data/show_data/{plot_filename}'
+
+
+def fetch_vitals_from_s3():
+    """Fetch latest vitals data from S3"""
+    global vitals_df, latest_vitals
+
+    if not s3_client:
+        return False
+
+    try:
+        year_month = datetime.now().strftime("%Y-%m")
+        s3_key = f"{PATIENT_ID}/time_series/{year_month}.csv"
+        obj = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+        csv_data = obj['Body'].read().decode('utf-8')
+        df = pd.read_csv(StringIO(csv_data))
+
+        if not df.empty:
+            vitals_df = df
+            latest_row = df.iloc[-1]
+            latest_vitals = {
+                'heart_rate': int(latest_row.get('heart_rate', 0)),
+                'spo2': int(latest_row.get('spo2', 0)),
+                'blood_pressure': {
+                    'systolic': int(latest_row.get('blood_pressure_systolic', 0)),
+                    'diastolic': int(latest_row.get('blood_pressure_diastolic', 0))
+                },
+                'skin_temperature': float(latest_row.get('skin_temperature', 0)),
+                'timestamp': int(pd.Timestamp(latest_row.get('time_stamp')).timestamp() * 1000),
+                'datetime': str(latest_row.get('time_stamp', 'Never')),
+                'patient_id': str(latest_row.get('patient_id', PATIENT_ID))
+            }
+            logger.info(f"✅ Fetched {len(df)} vitals records from S3")
+
+            if not setup_state['watch_connected'] and latest_vitals['heart_rate'] > 0:
+                setup_state['watch_connected'] = True
+                logger.info("✅ Smartwatch connected - vitals detected")
+
+            return True
+    except s3_client.exceptions.NoSuchKey:
+        logger.debug("No vitals data found yet")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Error fetching vitals: {e}")
+        return False
+
+
+def fetch_current_vitals_smart():
+    """Smart vitals fetcher - tries edge device first, falls back to S3"""
+    global latest_vitals
+
+    # Try edge device first (real-time data)
+    if edge_device_client.is_available():
+        logger.info("🔄 Fetching REAL-TIME vitals from edge device...")
+        realtime_vitals = edge_device_client.get_realtime_vitals()
+
+        if realtime_vitals:
+            latest_vitals = realtime_vitals
+            logger.info("✅ Got real-time vitals from edge device")
+            return True, "edge_device"
+
+    # Fallback to S3 (historical data)
+    logger.info("📦 Falling back to S3 for vitals data...")
+    success = fetch_vitals_from_s3()
+    return success, "s3"
+
+
+def fetch_glucose_from_s3():
+    """Fetch glucose data from S3"""
+    global glucose_df, latest_glucose
+
+    if not s3_client:
+        return False
+
+    try:
+        year_month = datetime.now().strftime("%Y-%m")
+        s3_key = f"{PATIENT_ID}/glucose/{year_month}.json"
+        obj = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+        glucose_data = json.loads(obj['Body'].read().decode('utf-8'))
+
+        if glucose_data:
+            glucose_df = pd.DataFrame(glucose_data)
+
+            try:
+                glucose_df['datetime'] = pd.to_datetime(glucose_df['datetime'], format='mixed')
+            except:
+                try:
+                    glucose_df['datetime'] = pd.to_datetime(glucose_df['datetime'])
+                except Exception as e:
+                    logger.error(f"❌ Error parsing glucose datetime: {e}")
+
+            glucose_df = glucose_df.sort_values('datetime')
+
+            latest_reading = glucose_data[-1]
+            latest_glucose = {
+                'value_mgdl': latest_reading.get('value_mgdl', 0),
+                'trend_arrow': latest_reading.get('trend_arrow', 0),
+                'is_high': latest_reading.get('is_high', False),
+                'is_low': latest_reading.get('is_low', False),
+                'datetime': latest_reading.get('datetime', 'Never'),
+                'patient_id': latest_reading.get('patient_id', PATIENT_ID)
+            }
+
+            if latest_glucose['is_high'] or latest_glucose['is_low']:
+                alert_type = "HIGH" if latest_glucose['is_high'] else "LOW"
+                trend = libre_api.get_trend_arrow_text(latest_glucose['trend_arrow']) if libre_api else ""
+
+                glucose_alert = f"""⚠️ GLUCOSE ALERT - {alert_type}!
+Patient: {latest_glucose['patient_id']}
+Glucose Level: {latest_glucose['value_mgdl']} mg/dL
+Trend: {trend}
+Time: {latest_glucose['datetime']}
+{'⬆️ Blood sugar is HIGH' if latest_glucose['is_high'] else '⬇️ Blood sugar is LOW'}
+Please take appropriate action!"""
+
+                socketio.emit('chat_message', {
+                    'type': 'emergency',
+                    'message': glucose_alert,
+                    'timestamp': latest_glucose['datetime']
+                }, namespace='/')
+
+            logger.info(f"✅ Fetched {len(glucose_data)} glucose readings from S3")
+            return True
+    except s3_client.exceptions.NoSuchKey:
+        logger.debug("No glucose data found yet")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Error fetching glucose: {e}")
+        return False
+
+
+def fetch_latest_glucose():
+    """Fetch the most recent glucose reading"""
+    global latest_glucose
+
+    if libre_api and libre_api.is_authenticated:
+        logger.info("🔄 Fetching fresh glucose from LibreLink...")
+        fresh_glucose = libre_api.get_glucose_data()
+
+        if fresh_glucose:
+            latest_glucose = fresh_glucose
+            logger.info(f"✅ Got fresh glucose from LibreLink: {fresh_glucose['value_mgdl']} mg/dL")
+            return True
+        else:
+            logger.warning("⚠️ LibreLink fetch failed, falling back to S3")
+
+    return fetch_glucose_from_s3()
+
+
+def fetch_fall_alerts_from_s3():
+    """Fetch fall alerts from S3"""
+    global fall_alerts, emitted_alert_ids
+
+    if not s3_client:
+        return False
+
+    try:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        s3_key = f"{PATIENT_ID}/fall_alerts/{date_str}.json"
+        obj = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+        alerts_data = obj['Body'].read().decode('utf-8')
+        alerts = json.loads(alerts_data)
+
+        existing_ids = {alert['id'] for alert in fall_alerts}
+        new_alerts = [alert for alert in alerts if alert['id'] not in existing_ids]
+
+        if new_alerts:
+            fall_alerts.extend(new_alerts)
+
+            for alert in new_alerts:
+                alert_id = alert.get('id')
+                if alert_id in emitted_alert_ids:
+                    continue
+
+                simple_payload = {
+                    "patient_id": alert.get("patient_id", PATIENT_ID),
+                    "confidence": alert.get("confidence", 0),
+                    "datetime": alert.get("datetime", "Unknown"),
+                    "type": "fall_alert"
+                }
+
+                socketio.emit('fall_alert', simple_payload, namespace='/')
+                emitted_alert_ids.add(alert_id)
+
+            logger.info(f"✅ {len(new_alerts)} NEW fall alerts emitted")
+        return True
+    except s3_client.exceptions.NoSuchKey:
+        logger.debug("No fall alerts found yet")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Error fetching fall alerts: {e}")
+        return False
+
+
+def fetch_wifi_connection_from_s3():
+    """Fetch WiFi connection from S3"""
+    global latest_wifi_connection, last_wifi_timestamp
+
+    if not s3_client:
+        return False
+
+    try:
+        s3_key = f"{PATIENT_ID}/wifi_connection.json"
+        obj = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+        wifi_data = obj['Body'].read().decode('utf-8')
+        wifi_info = json.loads(wifi_data)
+        wifi_timestamp = wifi_info.get('timestamp', 0)
+
+        if wifi_timestamp > last_wifi_timestamp:
+            last_wifi_timestamp = wifi_timestamp
+            latest_wifi_connection = wifi_info
+
+            if not setup_state['edge_device_connected']:
+                setup_state['edge_device_connected'] = True
+                logger.info("✅ Edge device connected to WiFi")
+                logger.info(f"   Network: {wifi_info.get('ssid', 'Unknown')}")
+                logger.info(f"   IP: {wifi_info.get('ip_address', 'Unknown')}")
+
+                # Set edge device IP for real-time data fetching
+                edge_device_ip = wifi_info.get('ip_address')
+                if edge_device_ip:
+                    edge_device_client.set_edge_device_ip(edge_device_ip)
+
+            return True
+    except s3_client.exceptions.NoSuchKey:
+        logger.debug("No WiFi connection file found yet")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Error fetching WiFi: {e}")
+        return False
+
+
+def check_signal_file():
+    """Check S3 signal file for updates"""
+    global last_signal_timestamp
+
+    if not s3_client:
+        return False
+
+    try:
+        obj = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key='signal_file.txt')
+        signal_data = json.loads(obj['Body'].read().decode('utf-8'))
+        signal_timestamp = signal_data.get('timestamp', 0)
+        signal_type = signal_data.get('type', '')
+
+        if signal_timestamp > last_signal_timestamp:
+            last_signal_timestamp = signal_timestamp
+            logger.info(f"📡 New signal: {signal_type}")
+
+            if signal_type == 'vitals_update':
+                fetch_vitals_from_s3()
+                socketio.emit('vitals_update', latest_vitals, namespace='/')
+            elif signal_type == 'fall_alert':
+                fetch_fall_alerts_from_s3()
+            elif signal_type == 'wifi_notification':
+                fetch_wifi_connection_from_s3()
+            elif signal_type == 'glucose_update':
+                fetch_glucose_from_s3()
+
+            return True
+    except s3_client.exceptions.NoSuchKey:
+        logger.debug("No signal file yet")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Error checking signal: {e}")
+        return False
+
+
+def s3_polling_loop():
+    """Background polling loop"""
+    global emitted_alert_ids
+
+    logger.info("🔄 Starting S3 polling loop...")
+
+    fetch_vitals_from_s3()
+    fetch_glucose_from_s3()
+
+    try:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        s3_key = f"{PATIENT_ID}/fall_alerts/{date_str}.json"
+        obj = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+        alerts_data = obj['Body'].read().decode('utf-8')
+        alerts = json.loads(alerts_data)
+        fall_alerts.extend(alerts)
+        emitted_alert_ids = {alert['id'] for alert in alerts}
+        logger.info(f"📥 Loaded {len(alerts)} existing alerts")
+    except:
+        pass
+
+    fetch_wifi_connection_from_s3()
+
+    while True:
+        try:
+            check_signal_file()
+            time.sleep(S3_POLL_INTERVAL)
+        except Exception as e:
+            logger.error(f"❌ Polling error: {e}")
+            time.sleep(S3_POLL_INTERVAL)
+
+
+def auto_login_librelink():
+    """Automatically login to LibreLink if credentials are in .env"""
+    global setup_state
+
+    if not libre_api:
+        logger.warning("⚠️ LibreLink API not initialized")
+        return False
+
+    if not LIBRELINK_EMAIL or not LIBRELINK_PASSWORD:
+        logger.info("ℹ️ LibreLink credentials not in .env - skipping auto-login")
+        return False
+
+    logger.info("🔐 Attempting auto-login to LibreLink...")
+    success, message = libre_api.login(LIBRELINK_EMAIL, LIBRELINK_PASSWORD)
+
+    if success:
+        logger.info(f"✅ {message}")
+        libre_api.start_monitoring(poll_interval=60)
+        setup_state['libre_setup_completed'] = True
+        setup_state['setup_completed'] = True
+        logger.info("🔄 Started LibreLink monitoring (every 1 minute)")
+        return True
+    else:
+        logger.error(f"❌ Auto-login failed: {message}")
+        return False
+
+
+@app.route("/")
+def index():
+    return render_template('doctor.html')
+
+
+@app.route("/api/setup_status", methods=['GET'])
+def get_setup_status():
+    """Get setup completion status"""
+    return jsonify({
+        'setup_completed': setup_state['setup_completed'],
+        'libre_connected': libre_api.is_authenticated if libre_api else False,
+        'libre_monitoring': libre_api.monitoring_active if libre_api else False,
+        'edge_device_connected': setup_state['edge_device_connected'],
+        'watch_connected': setup_state['watch_connected'],
+        'current_step': setup_state['current_step']
+    })
+
+
+@app.route("/api/skip_setup", methods=['POST'])
+def skip_setup():
+    """Skip setup and go straight to normal chat"""
+    setup_state['setup_completed'] = True
+    setup_state['current_step'] = None
+    return jsonify({
+        'status': 'success',
+        'message': 'Setup skipped. You can now use REMONI normally.'
+    })
+
+
+@app.route("/api/latest_vitals", methods=['GET'])
+def get_latest_vitals():
+    return jsonify(latest_vitals)
+
+
+@app.route("/api/latest_glucose", methods=['GET'])
+def get_latest_glucose():
+    """Get latest glucose - fetches fresh from LibreLink"""
+    fetch_latest_glucose()
+    return jsonify(latest_glucose)
+
+
+@app.route("/api/fall_alerts", methods=['GET'])
+def get_fall_alerts():
+    return jsonify({
+        'total': len(fall_alerts),
+        'alerts': fall_alerts
+    })
+
+
+@app.route("/api/edge_device_status", methods=['GET'])
+def get_edge_device_status():
+    """Check if edge device is reachable for real-time data"""
+    is_available = edge_device_client.is_available()
+
+    return jsonify({
+        'available': is_available,
+        'ip_address': edge_device_client.edge_device_ip,
+        'base_url': edge_device_client.base_url,
+        'configured': edge_device_client.edge_device_ip is not None
+    })
+
+
+@app.route("/chat", methods=['POST'])
+def chat():
+    """AI chat with simplified setup flow"""
+
+    question = request.get_json().get("message", "")
+    question_lower = question.lower()
+
+    # ========== SETUP FLOW ==========
+    if not setup_state['setup_completed']:
+
+        # ===== WELCOME STAGE =====
+        if setup_state['current_step'] is None:
+            if any(word in question_lower for word in ['start', 'begin', 'yes', 'setup']):
+                setup_state['current_step'] = 'step1_power'
+                return jsonify({
+                    "answer": SETUP_INSTRUCTIONS['step1_power'],
+                    "images": ["/static/setup_images/edge.jpeg"]
+                })
+            elif any(word in question_lower for word in ['skip', 'no', 'already', 'done', "don't"]):
+                setup_state['setup_completed'] = True
+                return jsonify({"answer": "✅ Setup skipped! You can start using REMONI now."})
+            else:
+                return jsonify({"answer": SETUP_INSTRUCTIONS['welcome']})
+
+        # ===== STEP 1: POWER UP =====
+        elif setup_state['current_step'] == 'step1_power':
+            if 'next' in question_lower or 'done' in question_lower or 'ready' in question_lower:
+                setup_state['current_step'] = 'step2_wifi_setup'
+                return jsonify({
+                    "answer": SETUP_INSTRUCTIONS['step2_wifi_setup'],
+                    "images": ["/static/setup_images/select_remoni_setup.jpeg"]
+                })
+            elif 'skip' in question_lower:
+                setup_state['setup_completed'] = True
+                setup_state['current_step'] = None
+                return jsonify({"answer": "Setup stopped. Type 'setup' to try again."})
+            else:
+                return jsonify({"answer": "Type 'next' when you see the lights or 'skip' to stop."})
+
+        # ===== STEP 2: WIFI SETUP =====
+        elif setup_state['current_step'] == 'step2_wifi_setup':
+            if 'next' in question_lower or 'done' in question_lower or 'connected' in question_lower:
+                setup_state['current_step'] = 'step3_wifi_config'
+                return jsonify({
+                    "answer": SETUP_INSTRUCTIONS['step3_wifi_config'],
+                    "images": ["/static/setup_images/scan_for_available_networks.jpeg",
+                               "/static/setup_images/wifi_config_screen.jpeg"]
+                })
+            else:
+                return jsonify({"answer": "Type 'next' when connected to REMONI-Setup."})
+
+        # ===== STEP 3: WIFI CONFIG =====
+        elif setup_state['current_step'] == 'step3_wifi_config':
+            if 'next' in question_lower or 'done' in question_lower or 'connected' in question_lower:
+                fetch_wifi_connection_from_s3()
+                setup_state['current_step'] = 'step4_glucose_intro'
+                return jsonify({"answer": SETUP_INSTRUCTIONS['step4_glucose_intro']})
+            else:
+                return jsonify({"answer": "Type 'next' when you see 'Connection Successful'."})
+
+        # ===== STEP 4: GLUCOSE INTRO =====
+        elif setup_state['current_step'] == 'step4_glucose_intro':
+            if 'next' in question_lower or 'yes' in question_lower:
+                setup_state['current_step'] = 'step5_libre_app'
+                return jsonify({
+                    "answer": SETUP_INSTRUCTIONS['step5_libre_app'],
+                    "images": ["/static/setup_images/freestyle_libre_install.jpeg"]
+                })
+            elif 'skip' in question_lower or 'no' in question_lower:
+                fetch_wifi_connection_from_s3()
+                edge_ip = latest_wifi_connection.get('ip_address', 'Unknown') if latest_wifi_connection else 'Unknown'
+                setup_state['current_step'] = 'step9_watch_app'
+                return jsonify({"answer": SETUP_INSTRUCTIONS['step9_watch_app'].format(edge_ip=edge_ip),
+                                "images": ["/static/setup_images/watch_app_connect.png"]})
+            else:
+                return jsonify({"answer": "Type 'next' for glucose setup or 'skip' to skip it."})
+
+        # ===== STEP 5: LIBRE APPS =====
+        elif setup_state['current_step'] == 'step5_libre_app':
+            if 'next' in question_lower:
+                setup_state['current_step'] = 'step6_connect_apps'
+                return jsonify({
+                    "answer": SETUP_INSTRUCTIONS['step6_connect_apps'],
+                    "images": ["/static/setup_images/libre_connection.jpeg",
+                               "/static/setup_images/libre_connection_2.jpeg"]
+                })
+            else:
+                return jsonify({"answer": "Type 'next' when both apps are installed."})
+
+        # ===== STEP 6: CONNECT APPS =====
+        elif setup_state['current_step'] == 'step6_connect_apps':
+            if 'next' in question_lower:
+                setup_state['current_step'] = 'step7_accept_connection'
+                return jsonify({
+                    "answer": SETUP_INSTRUCTIONS['step7_accept_connection'],
+                    "images": ["/static/setup_images/libre_accept.jpeg"]
+                })
+            else:
+                return jsonify({"answer": "Type 'next' when invitation is sent."})
+
+        # ===== STEP 7: ACCEPT =====
+        elif setup_state['current_step'] == 'step7_accept_connection':
+            if 'next' in question_lower:
+                setup_state['current_step'] = 'step8_enter_credentials'
+                return jsonify({"answer": SETUP_INSTRUCTIONS['step8_enter_credentials']})
+            else:
+                return jsonify({"answer": "Type 'next' when you see your glucose in LibreLinkUp."})
+
+        # ===== STEP 8: CREDENTIALS =====
+        elif setup_state['current_step'] == 'step8_enter_credentials':
+            if 'skip' in question_lower:
+                fetch_wifi_connection_from_s3()
+                edge_ip = latest_wifi_connection.get('ip_address', 'Unknown') if latest_wifi_connection else 'Unknown'
+                setup_state['current_step'] = 'step9_watch_app'
+                return jsonify({"answer": SETUP_INSTRUCTIONS['step9_watch_app'].format(edge_ip=edge_ip),
+                                "images": ["/static/setup_images/watch_app_connect.png"]})
+
+            email_match = re.search(r'email:\s*([^\s]+@[^\s]+)', question, re.IGNORECASE)
+            password_match = re.search(r'password:\s*(.+)', question, re.IGNORECASE)
+
+            if email_match and password_match:
+                email = email_match.group(1).strip()
+                password = password_match.group(1).strip()
+
+                if libre_api:
+                    success, message = libre_api.login(email, password)
+
+                    if success:
+                        libre_api.start_monitoring(poll_interval=60)
+                        setup_state['libre_setup_completed'] = True
+                        fetch_wifi_connection_from_s3()
+                        edge_ip = latest_wifi_connection.get('ip_address',
+                                                             'Unknown') if latest_wifi_connection else 'Unknown'
+                        setup_state['current_step'] = 'step9_watch_app'
+                        return jsonify({
+                                           "answer": f"✅ Glucose monitoring connected!\n\n{SETUP_INSTRUCTIONS['step9_watch_app'].format(edge_ip=edge_ip)}",
+                                           "images": ["/static/setup_images/watch_app_connect.png"]})
+                    else:
+                        return jsonify({"answer": f"❌ Login failed: {message}\nTry again or type 'skip'."})
+                else:
+                    return jsonify({"answer": "❌ Can't connect. Type 'skip' to continue."})
+            else:
+                return jsonify({"answer": "⚠️ Format: email: your@email.com\npassword: yourpassword"})
+
+        # ===== STEP 9: WATCH APP =====
+        elif setup_state['current_step'] == 'step9_watch_app':
+            if 'next' in question_lower:
+                # Wait and check for vitals
+                time.sleep(2)
+                fetch_vitals_from_s3()
+
+                if latest_vitals['heart_rate'] > 0:
+                    setup_state['watch_connected'] = True
+                    setup_state['setup_completed'] = True
+                    setup_state['current_step'] = None
+
+                    glucose_status = "Working" if setup_state['libre_setup_completed'] else "Not set up"
+                    watch_status = "Connected"
+
+                    return jsonify({"answer": SETUP_INSTRUCTIONS['step10_complete'].format(
+                        glucose_status=glucose_status,
+                        watch_status=watch_status
+                    )})
+                else:
+                    return jsonify(
+                        {"answer": "⏳ Waiting for watch data... Type 'next' to try again or 'skip' to finish."})
+            elif 'skip' in question_lower:
+                setup_state['setup_completed'] = True
+                setup_state['current_step'] = None
+                glucose_status = "Working" if setup_state['libre_setup_completed'] else "Not set up"
+                return jsonify({"answer": SETUP_INSTRUCTIONS['step10_complete'].format(
+                    glucose_status=glucose_status,
+                    watch_status="Skipped"
+                )})
+            else:
+                return jsonify({"answer": "Type 'next' when watch is connected or 'skip' to finish."})
+
+        return jsonify({"answer": "Type 'next', 'skip', or follow the instructions above."})
+
+    # ========== NORMAL CHAT AFTER SETUP ==========
+
+    if 'restart setup' in question_lower or question_lower == 'setup':
+        setup_state['setup_completed'] = False
+        setup_state['current_step'] = None
+        setup_state['libre_credentials'] = {}
+        setup_state['edge_device_connected'] = False
+        setup_state['watch_connected'] = False
+        setup_state['libre_setup_completed'] = False
+        return jsonify({"answer": SETUP_INSTRUCTIONS['welcome']})
+
+    intent_prompt = f"""Analyze this query and determine what the user wants: "{question}"
+
+Return ONLY a JSON object:
+{{
+    "intent": "current_vitals" or "current_glucose" or "system_status" or "fall_alerts" or "plot_data" or "general_chat" or "wifi_status",
+    "specific_vitals": ["heart_rate", "spo2", "blood_pressure", "temperature", "all"] (empty array if not asking for vitals),
+    "wants_plot": true or false,
+    "time_type": "readings" or "minutes" or "hours" or "days" (if asking for plot),
+    "time_value": number (if asking for plot)
+}}
+
+Examples:
+"what's the heart rate?" → {{"intent": "current_vitals", "specific_vitals": ["heart_rate"], "wants_plot": false}}
+"show me current glucose" → {{"intent": "current_glucose", "specific_vitals": [], "wants_plot": false}}
+"any fall alerts?" → {{"intent": "fall_alerts", "specific_vitals": [], "wants_plot": false}}
+"plot heart rate last 2 hours" → {{"intent": "plot_data", "specific_vitals": ["heart_rate"], "wants_plot": true, "time_type": "hours", "time_value": 2}}
+"what's the current vitals?" → {{"intent": "current_vitals", "specific_vitals": ["all"], "wants_plot": false}}
+"system status" → {{"intent": "system_status", "specific_vitals": [], "wants_plot": false}}
+
+Return ONLY the JSON."""
+
+    try:
+        llm_response = gpt(text=intent_prompt, model_name="gpt-3.5-turbo", temperature=0.1, max_tokens=150)
+        llm_response = llm_response.strip()
+        if llm_response.startswith('```'):
+            llm_response = llm_response.split('```')[1].replace('json', '').strip()
+
+        intent_data = json.loads(llm_response)
+        intent = intent_data.get('intent', 'general_chat')
+        specific_vitals = intent_data.get('specific_vitals', [])
+        wants_plot = intent_data.get('wants_plot', False)
+
+        logger.info(f"🤖 LLM Intent: {intent}, Vitals: {specific_vitals}, Plot: {wants_plot}")
+
+        # CURRENT VITALS
+        if intent == 'current_vitals':
+            success, source = fetch_current_vitals_smart()
+
+            if not success or latest_vitals['heart_rate'] == 0:
+                return jsonify({"answer": "⚠️ No health data available yet. Make sure your watch is connected."})
+
+            source_indicator = {"edge_device": "📡 Real-time", "s3": "📦 Cloud"}.get(source, "")
+
+            if specific_vitals and 'all' not in specific_vitals:
+                response_text = f"**Current Reading** {source_indicator}\n"
+
+                if 'heart_rate' in specific_vitals:
+                    response_text += f"❤️ Heart Rate: **{latest_vitals.get('heart_rate', 0)} BPM**\n"
+
+                if 'spo2' in specific_vitals or 'oxygen' in specific_vitals:
+                    response_text += f"🫁 Oxygen: **{latest_vitals.get('spo2', 0)}%**\n"
+
+                if 'blood_pressure' in specific_vitals or 'bp' in specific_vitals:
+                    bp = latest_vitals.get('blood_pressure', {})
+                    response_text += f"🩸 Blood Pressure: **{bp.get('systolic', 0)}/{bp.get('diastolic', 0)} mmHg**\n"
+
+                if 'temperature' in specific_vitals or 'temp' in specific_vitals:
+                    response_text += f"🌡️ Temperature: **{latest_vitals.get('skin_temperature', 0):.1f}°C**\n"
+
+                response_text += f"⏰ {latest_vitals.get('datetime', 'Never')}"
+
+                return jsonify({"answer": response_text})
+
+            else:
+                bp = latest_vitals.get('blood_pressure', {})
+                response_text = f"""💓 **Current Health** {source_indicator}
+❤️ Heart Rate: {latest_vitals.get('heart_rate', 0)} BPM
+🫁 Oxygen: {latest_vitals.get('spo2', 0)}%
+🩸 BP: {bp.get('systolic', 0)}/{bp.get('diastolic', 0)} mmHg
+🌡️ Temperature: {latest_vitals.get('skin_temperature', 0):.1f}°C
+⏰ {latest_vitals.get('datetime', 'Never')}"""
+                return jsonify({"answer": response_text})
+
+        # CURRENT GLUCOSE
+        elif intent == 'current_glucose':
+            fetch_latest_glucose()
+
+            if latest_glucose['value_mgdl'] == 0:
+                return jsonify({"answer": "⚠️ No glucose data. Make sure monitoring is set up."})
+
+            trend_text = ""
+            if libre_api:
+                trend_text = libre_api.get_trend_arrow_text(latest_glucose.get('trend_arrow', 0))
+
+            response_text = f"""📊 **Blood Sugar**
+Level: **{latest_glucose.get('value_mgdl', 0)} mg/dL**
+Trend: {trend_text}
+Status: {'⚠️ HIGH' if latest_glucose.get('is_high') else '⚠️ LOW' if latest_glucose.get('is_low') else '✅ Normal'}
+Time: {latest_glucose.get('datetime', 'Unknown')}"""
+
+            return jsonify({"answer": response_text})
+
+        # FALL ALERTS
+        elif intent == 'fall_alerts':
+            fetch_fall_alerts_from_s3()
+
+            if fall_alerts:
+                latest_fall = fall_alerts[-1]
+                response_text = f"""🚨 **Falls Today: {len(fall_alerts)}**
+Latest:
+• Time: {latest_fall.get('datetime', 'Unknown')}
+• Confidence: {latest_fall.get('confidence', 0)}%"""
+                return jsonify({"answer": response_text})
+            else:
+                return jsonify({"answer": "✅ No falls detected today."})
+
+        # SYSTEM STATUS
+        elif intent == 'system_status':
+            fetch_wifi_connection_from_s3()
+
+            response_text = f"""🔧 **System Status**
+Device: {'✓ Connected' if setup_state['edge_device_connected'] else '✗ Disconnected'}
+Glucose: {'✓ Working' if libre_api and libre_api.is_authenticated else '✗ Not set up'}
+Watch: {'✓ Connected' if setup_state['watch_connected'] else '✗ Not connected'}
+Cloud: {'✓ Connected' if s3_client else '✗ Disconnected'}"""
+
+            return jsonify({"answer": response_text})
+
+        # PLOT DATA
+        elif intent == 'plot_data' and wants_plot:
+            plots = []
+            time_type = intent_data.get('time_type', 'minutes')
+            time_value = intent_data.get('time_value', 60)
+
+            vital_to_plot = None
+            if 'glucose' in question_lower or 'sugar' in question_lower:
+                vital_to_plot = 'glucose'
+            elif 'heart' in question_lower or specific_vitals and 'heart_rate' in specific_vitals:
+                vital_to_plot = 'heart_rate'
+            elif 'spo2' in question_lower or 'oxygen' in question_lower:
+                vital_to_plot = 'spo2'
+            elif 'temperature' in question_lower or 'temp' in question_lower:
+                vital_to_plot = 'skin_temperature'
+            elif 'blood pressure' in question_lower or 'bp' in question_lower:
+                vital_to_plot = 'blood_pressure'
+
+            if vital_to_plot == 'glucose':
+                fetch_glucose_from_s3()
+                if not glucose_df.empty:
+                    df_filtered = None
+                    title_suffix = None
+
+                    if time_type == 'readings':
+                        df_filtered = filter_df_by_record_count(glucose_df, time_value)
+                        title_suffix = f"Last {time_value} Readings"
+                    elif time_type == 'minutes':
+                        df_filtered = filter_df_by_time_range(glucose_df, time_value)
+                        title_suffix = f"Last {time_value} Minutes"
+                    elif time_type == 'hours':
+                        time_range = time_value * 60
+                        df_filtered = filter_df_by_time_range(glucose_df, time_range)
+                        title_suffix = f"Last {time_value} Hour{'s' if time_value > 1 else ''}"
+                    elif time_type == 'days':
+                        time_range = time_value * 24 * 60
+                        df_filtered = filter_df_by_time_range(glucose_df, time_range)
+                        title_suffix = f"Last {time_value} Day{'s' if time_value > 1 else ''}"
+
+                    if df_filtered is not None and not df_filtered.empty:
+                        plot_path = create_plot(df_filtered, 'value_mgdl', title_suffix=title_suffix)
+                        if plot_path:
+                            plots.append(plot_path)
+                            return jsonify({"answer": f"📊 Blood sugar - {title_suffix}:", "plots": plots})
+
+                return jsonify({"answer": "⚠️ No glucose data for that period."})
+
+            elif vital_to_plot:
+                fetch_vitals_from_s3()
+                if not vitals_df.empty:
+                    df_filtered = None
+                    title_suffix = None
+
+                    if time_type == 'readings':
+                        df_filtered = filter_df_by_record_count(vitals_df, time_value)
+                        title_suffix = f"Last {time_value} Readings"
+                    elif time_type == 'minutes':
+                        df_filtered = filter_df_by_time_range(vitals_df, time_value)
+                        title_suffix = f"Last {time_value} Minutes"
+                    elif time_type == 'hours':
+                        time_range = time_value * 60
+                        df_filtered = filter_df_by_time_range(vitals_df, time_range)
+                        title_suffix = f"Last {time_value} Hour{'s' if time_value > 1 else ''}"
+                    elif time_type == 'days':
+                        time_range = time_value * 24 * 60
+                        df_filtered = filter_df_by_time_range(vitals_df, time_range)
+                        title_suffix = f"Last {time_value} Day{'s' if time_value > 1 else ''}"
+
+                    if df_filtered is not None and not df_filtered.empty:
+                        plot_path = create_plot(df_filtered, vital_to_plot, title_suffix=title_suffix)
+                        if plot_path:
+                            plots.append(plot_path)
+                            return jsonify({"answer": f"📊 {vital_to_plot.replace('_', ' ').title()} - {title_suffix}:",
+                                            "plots": plots})
+
+                return jsonify({"answer": "⚠️ No data for that period."})
+
+        # GENERAL CHAT
+        else:
+            context = f"""You are REMONI, a friendly nurse assistant.
+
+Current Data (Patient {PATIENT_ID}):
+- Heart Rate: {latest_vitals.get('heart_rate', 'N/A')} BPM
+- SpO2: {latest_vitals.get('spo2', 'N/A')}%
+- Blood Pressure: {latest_vitals['blood_pressure']['systolic']}/{latest_vitals['blood_pressure']['diastolic']} mmHg
+- Temperature: {latest_vitals.get('skin_temperature', 'N/A')}°C
+- Glucose: {latest_glucose.get('value_mgdl', 'N/A')} mg/dL
+
+Keep responses short (2-3 sentences). Be warm and helpful."""
+
+            ai_response = gpt(text=question, system_prompt=context, model_name="gpt-3.5-turbo", temperature=0.7,
+                              max_tokens=300)
+            return jsonify({"answer": ai_response})
+
+    except Exception as e:
+        logger.error(f"❌ Error: {e}")
+        try:
+            ai_response = get_ai_response(question, latest_vitals, latest_glucose)
+            return jsonify({"answer": ai_response})
+        except:
+            return jsonify({"answer": """I can help with:
+• Current readings
+• History charts
+• Fall alerts
+• System status
+What would you like?"""})
+
+
+if __name__ == '__main__':
+    print("\n" + "=" * 70)
+    print("🏥 REMONI - HEALTH MONITORING")
+    print("=" * 70)
+    print(f"📦 S3 Bucket: {S3_BUCKET_NAME}")
+    print(f"👤 Patient ID: {PATIENT_ID}")
+    print(f"🩺 LibreLink: {'Enabled' if libre_api else 'Disabled'}")
+    print("=" * 70 + "\n")
+
+    if LIBRELINK_EMAIL and LIBRELINK_PASSWORD:
+        logger.info("🔐 Auto-login to LibreLink...")
+        auto_login_librelink()
+    else:
+        logger.info("💡 Use setup wizard for LibreLink")
+
+    threading.Thread(target=s3_polling_loop, daemon=True).start()
+
+    print("🚀 Starting server on http://0.0.0.0:5001\n")
+    socketio.run(app, host='0.0.0.0', port=5001, debug=True)
