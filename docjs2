@@ -1,0 +1,300 @@
+class Chatbox {
+    constructor() {
+        this.args = {
+            chatBox: document.querySelector('.chatbox__support'),
+            sendButton: document.querySelector('.send__button'),
+        }
+
+        this.state = true;
+        this.messages = [];
+        this.setupInProgress = false;
+    }
+
+    // Convert markdown-like formatting to HTML
+    formatMessage(text) {
+        if (!text) return '';
+
+        // Convert **bold** to <strong>
+        text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+
+        // Convert bullet points
+        text = text.replace(/^[•\-]\s+(.+)$/gm, '<div class="bullet-item">• $1</div>');
+
+        // Convert numbered lists
+        text = text.replace(/^(\d+)\.\s+(.+)$/gm, '<div class="numbered-item">$1. $2</div>');
+
+        // Convert headers with emojis
+        text = text.replace(/^([🔌📱🌐⏳📊⌚📶📲✅🎉💓🚨🔧⚠️✉️🔗].+?)$/gm, '<div class="step-header">$1</div>');
+
+        // Convert line breaks
+        text = text.replace(/\n/g, '<br>');
+
+        return text;
+    }
+
+    display() {
+        const { chatBox, sendButton } = this.args;
+        sendButton.addEventListener('click', () => this.onSendButton(chatBox));
+
+        const node = chatBox.querySelector('.text_input');
+
+        node.addEventListener("keyup", ({ key }) => {
+            if (key === "Enter") {
+                this.onSendButton(chatBox);
+            }
+        });
+
+        chatBox.classList.add('chatbox--active');
+
+        // Check setup status
+        fetch('/api/setup_status')
+            .then(r => r.json())
+            .then(data => {
+                console.log('Setup status:', data);
+                if (!data.setup_completed) {
+                    this.setupInProgress = true;
+                    this.showSetupWelcome();
+                } else {
+                    this.setupInProgress = false;
+                    this.showNormalWelcome();
+                }
+            })
+            .catch((error) => {
+                console.error('Error checking setup status:', error);
+                this.showNormalWelcome();
+            });
+
+        // Connect to WebSocket
+        const socket = io();
+
+        socket.on('chat_message', (data) => {
+            console.log('Chat message received:', data);
+
+            const messageType = data.type || 'status';
+            const message = data.message || 'System notification';
+
+            if (messageType === 'wifi_notification') {
+                console.log('WiFi notification received');
+                return;
+            }
+
+            let messageClass = 'REMONI';
+
+            if (messageType === 'emergency') {
+                messageClass = 'REMONI_EMERGENCY';
+            } else if (messageType === 'vitals') {
+                messageClass = 'REMONI_VITALS';
+            } else if (messageType === 'status') {
+                messageClass = 'REMONI_STATUS';
+            }
+
+            this.messages.push({
+                name: messageClass,
+                message: message
+            });
+            this.updateChatText(chatBox);
+
+            if (messageType === 'emergency') {
+                this.playNotificationSound();
+            }
+        });
+
+        socket.on('fall_alert', (data) => {
+            console.log('🚨 Fall alert received:', data);
+
+            const fallMessage = `🚨 FALL ALERT!
+Patient ${data.patient_id || '00001'} - Fall Detected
+Time: ${data.datetime || new Date().toLocaleString()}
+Confidence: ${data.confidence || 0}%
+⚠️ Please check on the patient immediately.`;
+
+            this.messages.push({
+                name: 'REMONI_EMERGENCY',
+                message: fallMessage
+            });
+
+            this.updateChatText(chatBox);
+            this.playNotificationSound();
+        });
+
+        socket.on('vitals_update', (data) => {
+            console.log('Vitals update received:', data);
+        });
+
+        socket.on('glucose_update', (data) => {
+            console.log('Glucose update received:', data);
+
+            if (data.is_high || data.is_low) {
+                const alertType = data.is_high ? "HIGH" : "LOW";
+                const glucoseAlert = `⚠️ GLUCOSE ALERT - ${alertType}!
+Patient: ${data.patient_id}
+Level: ${data.value_mgdl} mg/dL
+Time: ${data.datetime}
+${data.is_high ? '⬆️ Blood sugar is HIGH' : '⬇️ Blood sugar is LOW'}
+Please take action!`;
+
+                this.messages.push({
+                    name: 'REMONI_EMERGENCY',
+                    message: glucoseAlert
+                });
+
+                this.updateChatText(chatBox);
+                this.playNotificationSound();
+            }
+        });
+    }
+
+    showSetupWelcome() {
+        const welcomeMessage = `👋 Hello! I'm REMONI, your virtual nurse.
+I'll help you set up your health monitoring system.
+Type 'start' to begin or 'skip' if already set up.`;
+
+        this.messages.push({ name: "REMONI", message: welcomeMessage });
+        this.updateChatText(this.args.chatBox);
+    }
+
+    showNormalWelcome() {
+        const welcomeMessage = `👋 Hello! I'm REMONI, your virtual nurse.
+I monitor your health 24/7.
+Ask me about:
+• Current vitals and glucose
+• Fall alerts
+• System status
+• Health history
+How can I help you?`;
+
+        this.messages.push({ name: "REMONI", message: welcomeMessage });
+        this.updateChatText(this.args.chatBox);
+    }
+
+    playNotificationSound() {
+        try {
+            const audio = new Audio('/static/notification.mp3');
+            audio.play().catch(e => console.log('Could not play sound:', e));
+        } catch (e) {
+            console.log('Notification sound not available');
+        }
+    }
+
+    isPlotImage(imagePath) {
+        return imagePath.includes('plot_');
+    }
+
+    onSendButton(chatbox) {
+        var textField = chatbox.querySelector('.text_input');
+        let text1 = textField.value
+        if (text1 === "") {
+            return;
+        }
+
+        let msg1 = { name: "User", message: text1 }
+        this.messages.push(msg1);
+        this.updateChatText(chatbox);
+        textField.value = '';
+
+        fetch($SCRIPT_ROOT + '/chat', {
+            method: 'POST',
+            body: JSON.stringify({ message: text1 }),
+            mode: 'cors',
+            headers: {
+              'Content-Type': 'application/json'
+            },
+          })
+          .then(r => r.json())
+          .then(r => {
+            console.log(r)
+            let msg2 = { name: "REMONI", message: r.answer };
+            this.messages.push(msg2);
+            this.updateChatText(chatbox);
+
+            if ('plots' in r && r.plots && r.plots.length > 0) {
+                console.log('showing plots');
+                let plotGroup = { name: "REMONI_Plot_Group", images: r.plots };
+                this.messages.push(plotGroup);
+                this.updateChatText(chatbox);
+            }
+
+            if ('images' in r && r.images && r.images.length > 0) {
+                console.log('showing images');
+                let imageGroup = { name: "REMONI_Setup_Image_Group", images: r.images };
+                this.messages.push(imageGroup);
+                this.updateChatText(chatbox);
+            }
+
+            if (r.answer.includes("All Done") || r.answer.includes("skipped")) {
+                this.setupInProgress = false;
+            }
+
+          }).catch((error) => {
+            let msg2 = { name: "REMONI", message: "Sorry, system error. Please try again." };
+            this.messages.push(msg2);
+            console.error('Error:', error);
+            this.updateChatText(chatbox);
+          });
+    }
+
+    updateChatText(chatbox) {
+        var html = '';
+
+        this.messages.forEach((item, index) => {
+            const formattedMessage = this.formatMessage(item.message);
+
+            if (item.name === "REMONI") {
+                html += '<div class="messages__item messages__item--visitor">' + formattedMessage + '</div>'
+            }
+            else if (item.name === "REMONI_EMERGENCY") {
+                html += '<div class="messages__item messages__item--emergency">' + formattedMessage + '</div>'
+            }
+            else if (item.name === "REMONI_VITALS") {
+                html += '<div class="messages__item messages__item--vitals">' + formattedMessage + '</div>'
+            }
+            else if (item.name === "REMONI_STATUS") {
+                html += '<div class="messages__item messages__item--status">' + formattedMessage + '</div>'
+            }
+            else if (item.name === "REMONI_Image") {
+                html += '<div class="messages__item--image-container">' +
+                        '<div class="messages__item--image-wrapper">' +
+                        '<img src="' + item.message + '" class="messages__item--image--operator">' +
+                        '</div>' +
+                        '</div>'
+            }
+            else if (item.name === "REMONI_Plot_Group") {
+                html += '<div class="messages__item--image-container">';
+                item.images.forEach(imgPath => {
+                    html += '<div class="messages__item--image-wrapper">' +
+                            '<img src="' + imgPath + '" class="messages__item--image--operator">' +
+                            '</div>';
+                });
+                html += '</div>';
+            }
+            else if (item.name === "REMONI_Setup_Image_Group") {
+                html += '<div class="messages__item--image-container">';
+                item.images.forEach(imgPath => {
+                    html += '<div class="messages__item--image-wrapper">' +
+                            '<img src="' + imgPath + '" class="messages__item--image--visitor">' +
+                            '</div>';
+                });
+                html += '</div>';
+            }
+            else if (item.name === "REMONI_Image_Group") {
+                html += '<div class="messages__item--image-container">';
+                item.images.forEach(imgPath => {
+                    html += '<div class="messages__item--image-wrapper">' +
+                            '<img src="' + imgPath + '" class="messages__item--image--operator">' +
+                            '</div>';
+                });
+                html += '</div>';
+            }
+            else {
+                html += '<div class="messages__item messages__item--operator">' + formattedMessage + '</div>'
+            }
+        });
+
+        const chatmessage = chatbox.querySelector('.chatbox__messages');
+        chatmessage.innerHTML = html;
+        chatmessage.scrollTop = chatmessage.scrollHeight;
+    }
+}
+
+const chatbox = new Chatbox();
+chatbox.display();
