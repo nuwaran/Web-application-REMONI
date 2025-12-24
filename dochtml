@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>REMONI - Health Monitor</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <link rel="stylesheet" href="{{ url_for('static', filename='doctor.css') }}">
+    <script src="https://cdn.socket.io/4.4.1/socket.io.min.js"></script>
+</head>
+
+<body>
+<div class="container">
+    <div class="chatbox">
+        <div class="chatbox__support">
+            <div class="chatbox__header">
+                <div class="chatbox__image--header">
+                    <img class='logo' src="/static/images/nurse.png" alt="image" width="45" height="45">
+                </div>
+                <div class="chatbox__content--header">
+                    <h4 class="chatbox__heading--header">REMONI - Virtual Assistant</h4>
+                </div>
+            </div>
+            <div class="chatbox__messages">
+                <div></div>
+            </div>
+            <div class="chatbox__footer">
+                <input type="text" class="text_input" placeholder="Type your message...">
+                <button class="chatbox__send--footer send__button">Send</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+    <script>
+        $SCRIPT_ROOT = {{ request.script_root|tojson }};
+    </script>
+    <script type="text/javascript" src="{{ url_for('static', filename='doctor.js') }}"></script>
+
+</body>
+
+</html>
